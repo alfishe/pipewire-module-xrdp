@@ -42,6 +42,7 @@
 #include <limits.h>
 #include <math.h>
 #include <time.h>
+#include <inttypes.h>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -206,6 +207,12 @@ struct impl {
 	struct spa_audio_info_raw info;  // common
 	uint32_t frame_size;  // only source
 
+	/* playback latency reports from chansrv, see SINK_MSG_LATENCY */
+	uint8_t sink_msg[12];  // only sink, data thread
+	uint32_t sink_msg_len;  // only sink, data thread
+	unsigned int sink_latency_acked:1;  // only sink, data thread
+	uint64_t sink_latency_ns;  // only sink, main thread
+
 	unsigned int do_disconnect:1;  // common
 	uint32_t leftover_count;  // only source
 	uint8_t *leftover;  // only source
@@ -295,11 +302,82 @@ static int lrecv(int fd, char *data, int bytes) {
     return recved;
 }
 
+/* Messages from chansrv on the sink socket. chansrv announces playback
+ * latency reports with one SINK_MSG_LATENCY when we connect; answering
+ * with an empty SINK_MSG_LATENCY makes it send updates. The latency is
+ * the time from chansrv receiving a sample to the client playing it. */
+#define SINK_MSG_DATA 0
+#define SINK_MSG_CLOSE 1
+#define SINK_MSG_LATENCY 2
+
+static int do_update_sink_latency(struct spa_loop *loop ATTR_UNUSED,
+		bool async ATTR_UNUSED, uint32_t seq ATTR_UNUSED,
+		const void *data, size_t size ATTR_UNUSED, void *user_data)
+{
+	struct impl *impl = user_data;
+	struct spa_process_latency_info info;
+	const struct spa_pod *params[1];
+	uint8_t buffer[1024];
+	struct spa_pod_builder b;
+	uint64_t ns;
+
+	memcpy(&ns, data, sizeof(ns));
+	if (impl->stream_sink == NULL || ns == impl->sink_latency_ns)
+		return 0;
+	impl->sink_latency_ns = ns;
+	pw_log_info("xrdp sink playback latency %" PRIu64 " us", ns / 1000);
+
+	spa_zero(info);
+	info.ns = ns;
+	spa_pod_builder_init(&b, buffer, sizeof(buffer));
+	params[0] = spa_process_latency_build(&b, SPA_PARAM_ProcessLatency, &info);
+	pw_stream_update_params(impl->stream_sink, params, 1);
+	return 0;
+}
+
+/* data thread: read whatever chansrv sent without blocking */
+static int read_sink_messages(struct impl *impl) {
+	for (;;) {
+		ssize_t n = recv(impl->fd_sink, impl->sink_msg + impl->sink_msg_len,
+				sizeof(impl->sink_msg) - impl->sink_msg_len, MSG_DONTWAIT);
+		if (n == 0)
+			return -1;
+		if (n < 0)
+			return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
+		impl->sink_msg_len += n;
+		if (impl->sink_msg_len < sizeof(impl->sink_msg))
+			continue;
+		impl->sink_msg_len = 0;
+
+		uint32_t code, bytes, us;
+		memcpy(&code, impl->sink_msg, 4);
+		memcpy(&bytes, impl->sink_msg + 4, 4);
+		memcpy(&us, impl->sink_msg + 8, 4);
+		if (code != SINK_MSG_LATENCY || bytes != sizeof(impl->sink_msg)) {
+			pw_log_warn("unexpected message %u size %u from xrdp sink", code, bytes);
+			return -1;
+		}
+		if (!impl->sink_latency_acked) {
+			struct header h;
+			h.code = SINK_MSG_LATENCY;
+			h.bytes = 8;
+			if (lsend(impl->fd_sink, (char*)(&h), 8) != 8)
+				return -1;
+			impl->sink_latency_acked = 1;
+		}
+		if (us != 0) {
+			uint64_t ns = (uint64_t)us * SPA_NSEC_PER_USEC;
+			pw_loop_invoke(pw_context_get_main_loop(impl->context),
+					do_update_sink_latency, 0, &ns, sizeof(ns), false, impl);
+		}
+	}
+}
+
 static int close_send_sink(struct impl *impl) {
     pw_log_info("close_send_sink");
     if (impl->fd_sink != -1) {
 		struct header h;
-		h.code = 1;
+		h.code = SINK_MSG_CLOSE;
 		h.bytes = 8;
 	    if (lsend(impl->fd_sink, (char*)(&h), 8) != 8) {
     	    pw_log_debug("close_send: send failed");
@@ -468,7 +546,16 @@ static void playback_stream_process(void *data)
     if (impl->fd_sink == -1) {
         if ((impl->fd_sink = conect_xrdp_socket(impl, impl->filename_sink)) == -1)
             goto error;
+        impl->sink_msg_len = 0;
+        impl->sink_latency_acked = 0;
 	}
+
+    if (read_sink_messages(impl) != 0) {
+        pw_log_warn("xrdp sink connection lost");
+        close(impl->fd_sink);
+        impl->fd_sink = -1;
+        goto error;
+    }
 
 	for (uint32_t i = 0; i < buf->buffer->n_datas; i++) {
         uint32_t size, offs;
@@ -481,7 +568,7 @@ static void playback_stream_process(void *data)
         size_all += size;
     }
     struct header h;
-    h.code = 0;
+    h.code = SINK_MSG_DATA;
     h.bytes = 8 + size_all;
     if (lsend(impl->fd_sink, (char*)(&h), 8) != 8) {
         pw_log_warn("data_send: send failed");
