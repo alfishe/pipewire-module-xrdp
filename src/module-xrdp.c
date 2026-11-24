@@ -315,7 +315,7 @@ static int do_update_sink_latency(struct spa_loop *loop ATTR_UNUSED,
 		const void *data, size_t size ATTR_UNUSED, void *user_data)
 {
 	struct impl *impl = user_data;
-	struct spa_process_latency_info info;
+	struct spa_latency_info info;
 	const struct spa_pod *params[1];
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
@@ -327,10 +327,14 @@ static int do_update_sink_latency(struct spa_loop *loop ATTR_UNUSED,
 	impl->sink_latency_ns = ns;
 	pw_log_info("xrdp sink playback latency %" PRIu64 " us", ns / 1000);
 
-	spa_zero(info);
-	info.ns = ns;
+	/* The playback latency of a sink is the Latency param of its input
+	 * port, which PipeWire passes upstream to the players. A stream does
+	 * not turn ProcessLatency into port latency (PipeWire 1.0), so set
+	 * the port latency directly, as module-pulse-tunnel does. */
+	info = SPA_LATENCY_INFO(SPA_DIRECTION_INPUT);
+	info.min_ns = info.max_ns = ns;
 	spa_pod_builder_init(&b, buffer, sizeof(buffer));
-	params[0] = spa_process_latency_build(&b, SPA_PARAM_ProcessLatency, &info);
+	params[0] = spa_latency_build(&b, SPA_PARAM_Latency, &info);
 	pw_stream_update_params(impl->stream_sink, params, 1);
 	return 0;
 }

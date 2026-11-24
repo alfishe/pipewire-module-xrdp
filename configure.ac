@@ -86,5 +86,6 @@ AX_APPEND_COMPILE_FLAGS([-Wwrite-strings])
 
 AC_CONFIG_FILES([Makefile
                  src/Makefile
-                 instfiles/Makefile])
+                 instfiles/Makefile
+                 tests/Makefile])
 AC_OUTPUT
